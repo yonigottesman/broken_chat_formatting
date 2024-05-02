@@ -2,9 +2,13 @@ import argparse
 import re
 from functools import partial
 
+import torch
 import yaml
 from datasets import DatasetDict, load_dataset
-from transformers import AutoTokenizer
+from peft import LoraConfig, PeftConfig
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+
+chat_template = "{% for message in messages %}\n{% if message['role'] == 'user' %}\n{{ '<|user|>\n' + message['content'] + eos_token }}\n{% elif message['role'] == 'system' %}\n{{ '<|system|>\n' + message['content'] + eos_token }}\n{% elif message['role'] == 'assistant' %}\n{{ '<|assistant|>\n'  + message['content'] + eos_token }}\n{% endif %}\n{% if loop.last and add_generation_prompt %}\n{{ '<|assistant|>' }}\n{% endif %}\n{% endfor %}"
 
 
 def tokenize_normal(example, tokenizer):
@@ -44,7 +48,28 @@ def train(config: dict, ignore_user_messages: bool):
     dataset.pop("test_gen")
     dataset.pop("train_gen")
     dataset = dataset.map(tokenizer_fn, batched=False, num_proc=12, remove_columns=["prompt", "prompt_id", "messages"])
-    print("yonigo")
+
+    peft_config = LoraConfig(
+        r=64,
+        lora_alpha=16,
+        lora_dropout=0.05,
+        bias="none",
+        task_type="CAUSAL_LM",
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+    )
+
+    quantization_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_compute_dtype=torch.bfloat16,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_use_double_quant=False,
+    )
+    model = AutoModelForCausalLM.from_pretrained(
+        "mistralai/Mistral-7B-v0.1",
+        torch_dtype=torch.bfloat16,
+        use_flash_attention_2=False,
+        quantization_config=quantization_config,
+    )
 
 
 if __name__ == "__main__":

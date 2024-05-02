@@ -3,3 +3,6 @@ datasets
 trl
 transformers[torch]
 pandas
+peft
+bitsandbytes
+accelerate
