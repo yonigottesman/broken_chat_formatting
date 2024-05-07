@@ -85,7 +85,7 @@ def get_model():
         trust_remote_code=True,
         attn_implementation="flash_attention_2",
         quantization_config=quantization_config,
-        use_cache=True,
+        use_cache=False,
     )
     model = prepare_model_for_kbit_training(model)
     lora_config = LoraConfig(
