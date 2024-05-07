@@ -14,12 +14,12 @@ from transformers import (
     TrainingArguments,
 )
 
-chat_template = "{% for message in messages %}\n{% if message['role'] == 'user' %}\n{{ '<|user|>\n' + message['content'] + eos_token }}\n{% elif message['role'] == 'system' %}\n{{ '<|system|>\n' + message['content'] + eos_token }}\n{% elif message['role'] == 'assistant' %}\n{{ '<|assistant|>\n'  + message['content'] + eos_token }}\n{% endif %}\n{% if loop.last and add_generation_prompt %}\n{{ '<|assistant|>' }}\n{% endif %}\n{% endfor %}"
-
 
 def tokenize_normal(example, tokenizer):
     messages = example["messages"]
-    tokenized = tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=False, return_dict=True)
+    tokenized = tokenizer.apply_chat_template(
+        messages, tokenize=True, add_generation_prompt=False, return_dict=True, truncation=True
+    )
     tokenized["labels"] = tokenized["input_ids"].copy()
     return tokenized
 
@@ -27,16 +27,19 @@ def tokenize_normal(example, tokenizer):
 def tokenizer_ignore_user_messages(example, tokenizer):
     messages = example["messages"]
     text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
-    tokenized = tokenizer(text, add_special_tokens=False)
+    tokenized = tokenizer(text, add_special_tokens=False, truncation=True)
 
-    pattern = re.escape("<|assistant|>\n") + r"(.*?" + re.escape(tokenizer.eos_token) + ")"
+    pattern = re.escape("<|assistant|>\n") + r"(.*?" + re.escape("<|end|>") + ")"
     assistent_start_end = [(m.start(1), m.end(1)) for m in re.finditer(pattern, text, re.DOTALL)]
 
     labels = [-100] * len(tokenized["input_ids"])
     for start, end in assistent_start_end:
-        for i in range(start, end):
-            token = tokenized.char_to_token(i)
-            labels[token] = tokenized["input_ids"][token]
+        start_token = tokenized.char_to_token(start)
+        end_token = tokenized.char_to_token(end - 1)
+        if start_token is None:
+            break  # start is after truncated text
+        for token_id in range(start_token, end_token + 1 if end_token else len(tokenized["input_ids"])):
+            labels[token_id] = tokenized["input_ids"][token_id]
     tokenized["labels"] = labels
     return tokenized
 
@@ -53,15 +56,17 @@ def datasets(tokenizer, ignore_user_messages: bool):
         num_proc=12,
         remove_columns=["prompt", "prompt_id", "messages"],
         fn_kwargs={"tokenizer": tokenizer},
+        load_from_cache_file=True,
     )
 
-    # for the validation i want to track the loss of the assistant messages only
+    # for the validation I want to track the loss of the assistant messages only!
     val_ds = dataset["test_sft"].map(
         tokenizer_ignore_user_messages,
         batched=False,
         num_proc=12,
         remove_columns=["prompt", "prompt_id", "messages"],
         fn_kwargs={"tokenizer": tokenizer},
+        load_from_cache_file=True,
     )
 
     return train_ds, val_ds
@@ -75,24 +80,26 @@ def get_model():
         bnb_4bit_use_double_quant=False,
     )
     model = AutoModelForCausalLM.from_pretrained(
-        "mistralai/Mistral-7B-v0.1",
+        "microsoft/Phi-3-mini-4k-instruct",
         torch_dtype=torch.bfloat16,
+        trust_remote_code=True,
         attn_implementation="flash_attention_2",
         quantization_config=quantization_config,
+        use_cache=True,
     )
     model = prepare_model_for_kbit_training(model)
     lora_config = LoraConfig(
-        r=64,
-        lora_alpha=16,
+        r=16,
+        lora_alpha=32,
         lora_dropout=0.05,
         bias="none",
         task_type="CAUSAL_LM",
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],  # , "gate_proj", "up_proj", "down_proj"],
+        target_modules="all-linear",
     )
 
     model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
-    print("model size", calculate_maximum_sizes(model)[0] / 1024 / 1024 / 1024)
+    print("model size GB ", calculate_maximum_sizes(model)[0] / 1024 / 1024 / 1024)
 
     return model
 
@@ -124,10 +131,9 @@ def collate_fn(examples, pad_token_id):
 
 
 def train(ignore_user_messages: bool):
-
-    tokenizer = AutoTokenizer.from_pretrained("mistralai/Mistral-7B-v0.1")
-    tokenizer.chat_template = chat_template
-
+    tokenizer = AutoTokenizer.from_pretrained("microsoft/Phi-3-mini-4k-instruct")
+    tokenizer.pad_token = tokenizer.unk_token
+    tokenizer.pad_token_id = tokenizer.convert_tokens_to_ids(tokenizer.pad_token)
     model = get_model()
 
     train_ds, val_ds = datasets(tokenizer, ignore_user_messages)
@@ -137,21 +143,22 @@ def train(ignore_user_messages: bool):
         bf16=True,
         do_eval=True,
         evaluation_strategy="epoch",
-        gradient_accumulation_steps=2,
+        gradient_accumulation_steps=1,
         gradient_checkpointing=True,
         gradient_checkpointing_kwargs={"use_reentrant": False},
-        learning_rate=2.0e-04,
-        logging_steps=5,
+        learning_rate=5.0e-06,
+        logging_steps=20,
         logging_strategy="steps",
         lr_scheduler_type="cosine",
         num_train_epochs=1,
+        max_steps=-1,
         overwrite_output_dir=True,
-        per_device_eval_batch_size=1,
-        per_device_train_batch_size=1,
+        per_device_eval_batch_size=2,
+        per_device_train_batch_size=2,
         save_strategy="steps",
         save_steps=100,
         save_total_limit=1,
-        warmup_ratio=0.1,
+        warmup_ratio=0.2,
         report_to="none",
     )
     trainer = Trainer(
@@ -159,7 +166,7 @@ def train(ignore_user_messages: bool):
         args=args,
         train_dataset=train_ds,
         eval_dataset=val_ds,
-        data_collator=partial(collate_fn, pad_token_id=tokenizer.eos_token_id),
+        data_collator=partial(collate_fn, pad_token_id=tokenizer.pad_token_id),
     )
     trainer.train()
 
