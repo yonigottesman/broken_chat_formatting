@@ -3,6 +3,7 @@ import re
 from functools import partial
 
 import torch
+import yaml
 from accelerate.utils import calculate_maximum_sizes
 from datasets import load_dataset
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
@@ -13,6 +14,49 @@ from transformers import (
     Trainer,
     TrainingArguments,
 )
+
+
+def setup_chatml_format(model, tokenizer):
+    chatml_template = (
+        "{% for message in messages %}\n"
+        "{% if message['role'] == 'user' %}\n"
+        "{{ '<|user|>\n' + message['content'] + eos_token }}\n"
+        "{% elif message['role'] == 'system' %}\n"
+        "{{ '<|system|>\n' + message['content'] + eos_token }}\n"
+        "{% elif message['role'] == 'assistant' %}\n"
+        "{{ '<|assistant|>\n'  + message['content'] + eos_token }}\n"
+        "{% endif %}\n"
+        "{% if loop.last and add_generation_prompt %}\n"
+        "{{ '<|assistant|>' }}\n"
+        "{% endif %}\n"
+        "{% endfor %}"
+    )
+
+    bos_token: str = "<|im_start|>"
+    eos_token: str = "<|im_end|>"
+    pad_token: str = "<|im_end|>"
+
+    # set special tokens and them
+    tokenizer.eos_token = eos_token
+    tokenizer.pad_token = pad_token
+    tokenizer.bos_token = bos_token
+    tokenizer.add_special_tokens({"additional_special_tokens": [bos_token, eos_token]})
+    # set chat format for tokenizer
+    tokenizer.chat_template = chatml_template
+
+    model.resize_token_embeddings(len(tokenizer))
+    # Update the model config to use the new eos & bos tokens
+    if getattr(model, "config", None) is not None:
+        model.config.pad_token_id = tokenizer.pad_token_id
+        model.config.bos_token_id = tokenizer.bos_token_id
+        model.config.eos_token_id = tokenizer.eos_token_id
+    # Update the generation config to use the new eos & bos token
+    if getattr(model, "generation_config", None) is not None:
+        model.generation_config.bos_token_id = tokenizer.bos_token_id
+        model.generation_config.eos_token_id = tokenizer.eos_token_id
+        model.generation_config.pad_token_id = tokenizer.pad_token_id
+
+    return model, tokenizer
 
 
 def tokenize_normal(example, tokenizer):
@@ -29,7 +73,7 @@ def tokenizer_ignore_user_messages(example, tokenizer):
     text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
     tokenized = tokenizer(text, add_special_tokens=False, truncation=True)
 
-    pattern = re.escape("<|assistant|>\n") + r"(.*?" + re.escape("<|end|>") + ")"
+    pattern = re.escape("<|assistant|>\n") + r"(.*?" + re.escape(tokenizer.eos_token) + ")"
     assistent_start_end = [(m.start(1), m.end(1)) for m in re.finditer(pattern, text, re.DOTALL)]
 
     labels = [-100] * len(tokenized["input_ids"])
@@ -44,13 +88,13 @@ def tokenizer_ignore_user_messages(example, tokenizer):
     return tokenized
 
 
-def datasets(tokenizer, ignore_user_messages: bool):
+def datasets(config, tokenizer, ignore_user_messages: bool):
 
     train_tokenizer_fn = tokenizer_ignore_user_messages if ignore_user_messages else tokenize_normal
 
-    dataset = load_dataset("HuggingFaceH4/ultrachat_200k")
+    dataset = load_dataset(config["dataset"]["name"])
 
-    train_ds = dataset["train_sft"].map(
+    train_ds = dataset[config["dataset"]["train_split"]].map(
         train_tokenizer_fn,
         batched=False,
         num_proc=12,
@@ -60,7 +104,7 @@ def datasets(tokenizer, ignore_user_messages: bool):
     )
 
     # for the validation I want to track the loss of the assistant messages only!
-    val_ds = dataset["test_sft"].map(
+    val_ds = dataset[config["dataset"]["val_split"]].map(
         tokenizer_ignore_user_messages,
         batched=False,
         num_proc=12,
@@ -72,34 +116,21 @@ def datasets(tokenizer, ignore_user_messages: bool):
     return train_ds, val_ds
 
 
-def get_model():
-    quantization_config = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_compute_dtype=torch.bfloat16,
-        bnb_4bit_quant_type="nf4",
-        bnb_4bit_use_double_quant=False,
-    )
+def get_model(config):
+    quantization_config = BitsAndBytesConfig(**config["quantization"])
+    config["model_args"]["torch_dtype"] = getattr(torch, config["model_args"]["torch_dtype"])
     model = AutoModelForCausalLM.from_pretrained(
-        "microsoft/Phi-3-mini-4k-instruct",
-        torch_dtype=torch.bfloat16,
-        trust_remote_code=True,
-        attn_implementation="flash_attention_2",
+        config["model_name_or_path"],
         quantization_config=quantization_config,
-        use_cache=False,
+        **config["model_args"],
     )
+
     model = prepare_model_for_kbit_training(model)
-    lora_config = LoraConfig(
-        r=16,
-        lora_alpha=32,
-        lora_dropout=0.05,
-        bias="none",
-        task_type="CAUSAL_LM",
-        target_modules="all-linear",
-    )
+    lora_config = LoraConfig(**config["lora"])
 
     model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
-    print("model size GB ", calculate_maximum_sizes(model)[0] / 1024 / 1024 / 1024)
+    print("model size GB ", round(calculate_maximum_sizes(model)[0] / 1024 / 1024 / 1024, 2))
 
     return model
 
@@ -130,37 +161,15 @@ def collate_fn(examples, pad_token_id):
     return batch
 
 
-def train(ignore_user_messages: bool):
-    tokenizer = AutoTokenizer.from_pretrained("microsoft/Phi-3-mini-4k-instruct")
-    tokenizer.pad_token = tokenizer.unk_token
-    tokenizer.pad_token_id = tokenizer.convert_tokens_to_ids(tokenizer.pad_token)
-    model = get_model()
+def train(config: dict, ignore_user_messages: bool):
+    tokenizer = AutoTokenizer.from_pretrained(config["model_name_or_path"])
+    assert tokenizer.chat_template is None, "modify `tokenizer_ignore_user_messages` to handle specific chat template."
+    model = get_model(config)
+    model, tokenizer = setup_chatml_format(model, tokenizer)
 
-    train_ds, val_ds = datasets(tokenizer, ignore_user_messages)
+    train_ds, val_ds = datasets(config, tokenizer, ignore_user_messages)
 
-    args = TrainingArguments(
-        output_dir="./output/",
-        bf16=True,
-        do_eval=True,
-        evaluation_strategy="epoch",
-        gradient_accumulation_steps=1,
-        gradient_checkpointing=True,
-        gradient_checkpointing_kwargs={"use_reentrant": False},
-        learning_rate=5.0e-06,
-        logging_steps=20,
-        logging_strategy="steps",
-        lr_scheduler_type="cosine",
-        num_train_epochs=1,
-        max_steps=-1,
-        overwrite_output_dir=True,
-        per_device_eval_batch_size=2,
-        per_device_train_batch_size=2,
-        save_strategy="steps",
-        save_steps=100,
-        save_total_limit=1,
-        warmup_ratio=0.2,
-        report_to="none",
-    )
+    args = TrainingArguments(**config["training_args"])
     trainer = Trainer(
         model=model,
         args=args,
@@ -173,7 +182,12 @@ def train(ignore_user_messages: bool):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
+    parser.add_argument("config", help="config yaml path")
     parser.add_argument("--ignore-user-messages", help="Ignore user tokens in training", required=True, type=bool)
 
     args, unknown_args = parser.parse_known_args()
-    train(args.ignore_user_messages)
+
+    with open(args.config, "r") as f:
+        config = yaml.safe_load(f)
+
+    train(config, args.ignore_user_messages)
