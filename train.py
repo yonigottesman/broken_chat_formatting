@@ -183,7 +183,13 @@ def train(config: dict, ignore_user_messages: bool):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("config", help="config yaml path")
-    parser.add_argument("--ignore-user-messages", help="Ignore user tokens in training", required=True, type=bool)
+    parser.add_argument(
+        "--ignore-user-messages",
+        help="mask user tokens",
+        required=True,
+        type=bool,
+        action=argparse.BooleanOptionalAction,
+    )
 
     args, unknown_args = parser.parse_known_args()
 
