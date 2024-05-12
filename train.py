@@ -163,7 +163,9 @@ def collate_fn(examples, pad_token_id):
 
 def train(config: dict, ignore_user_messages: bool):
     tokenizer = AutoTokenizer.from_pretrained(config["model_name_or_path"])
+    tokenizer.model_max_length = 2048
     assert tokenizer.chat_template is None, "modify `tokenizer_ignore_user_messages` to handle specific chat template."
+
     model = get_model(config)
     model, tokenizer = setup_chatml_format(model, tokenizer)
 

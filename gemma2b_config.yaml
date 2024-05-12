@@ -1,13 +1,13 @@
 dataset:
-  name: HuggingFaceH4/no_robots
-  train_split: train
-  val_split: test
+  name: HuggingFaceH4/deita-10k-v0-sft #HuggingFaceH4/no_robots
+  train_split: train_sft
+  val_split: test_sft
 
 model_name_or_path: google/gemma-2b
 
 quantization:
   load_in_4bit: True
-  bnb_4bit_compute_dtype: float16
+  bnb_4bit_compute_dtype: bfloat16
   bnb_4bit_quant_type: nf4
   bnb_4bit_use_double_quant: False
 
@@ -36,20 +36,20 @@ lora:
 
 training_args:
   output_dir: ./output/
-  bf16: False
+  bf16: True
   fp16: False
   do_eval: True
   max_grad_norm: 0.3
   weight_decay: 0.001
   evaluation_strategy: steps
-  gradient_accumulation_steps: 4
+  gradient_accumulation_steps: 1 #4
   gradient_checkpointing: True
   gradient_checkpointing_kwargs: { "use_reentrant": False }
-  learning_rate: 2e-4
+  learning_rate: 0.00002
   logging_steps: 20
-  logging_strategy: "steps"
-  lr_scheduler_type: constant
-  num_train_epochs: 10
+  logging_strategy: steps
+  lr_scheduler_type: cosine
+  num_train_epochs: 3
   max_steps: -1
   overwrite_output_dir: True
   per_device_eval_batch_size: 4
@@ -57,6 +57,7 @@ training_args:
   save_strategy: steps
   save_steps: 100
   save_total_limit: 1
-  warmup_ratio: 0.3
+  warmup_ratio: 0.1
   optim: paged_adamw_32bit
   report_to: none
+  seed: 42
