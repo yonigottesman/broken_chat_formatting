@@ -88,17 +88,31 @@ def tokenizer_ignore_user_messages(example, tokenizer):
     return tokenized
 
 
+def fix_universal_ner(example):
+    return {
+        "messages": [
+            {"content": m["value"], "role": "assistant" if m["from"] == "gpt" else "user"}
+            for m in example["conversations"]
+        ]
+    }
+
+
 def datasets(config, tokenizer, ignore_user_messages: bool):
 
     train_tokenizer_fn = tokenizer_ignore_user_messages if ignore_user_messages else tokenize_normal
 
     dataset = load_dataset(config["dataset"]["name"])
 
+    if config["dataset"]["name"] == "Universal-NER/Pile-NER-type":
+        dataset = dataset.map(fix_universal_ner, batched=False, num_proc=12, remove_columns=["conversations"])["train"]
+        dataset = dataset.train_test_split(test_size=0.02, seed=42)
+
+    columns = ["input_ids", "labels", "attention_mask"]
     train_ds = dataset[config["dataset"]["train_split"]].map(
         train_tokenizer_fn,
         batched=False,
         num_proc=12,
-        remove_columns=["prompt", "prompt_id", "messages"],
+        remove_columns=[i for i in dataset[config["dataset"]["train_split"]].column_names if i not in columns],
         fn_kwargs={"tokenizer": tokenizer},
         load_from_cache_file=True,
     )
@@ -108,7 +122,7 @@ def datasets(config, tokenizer, ignore_user_messages: bool):
         tokenizer_ignore_user_messages,
         batched=False,
         num_proc=12,
-        remove_columns=["prompt", "prompt_id", "messages"],
+        remove_columns=[i for i in dataset[config["dataset"]["val_split"]].column_names if i not in columns],
         fn_kwargs={"tokenizer": tokenizer},
         load_from_cache_file=True,
     )
