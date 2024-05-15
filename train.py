@@ -16,46 +16,10 @@ from transformers import (
 )
 
 
-def setup_chatml_format(model, tokenizer):
-    chatml_template = (
-        "{% for message in messages %}\n"
-        "{% if message['role'] == 'user' %}\n"
-        "{{ '<|user|>\n' + message['content'] + eos_token }}\n"
-        "{% elif message['role'] == 'system' %}\n"
-        "{{ '<|system|>\n' + message['content'] + eos_token }}\n"
-        "{% elif message['role'] == 'assistant' %}\n"
-        "{{ '<|assistant|>\n'  + message['content'] + eos_token }}\n"
-        "{% endif %}\n"
-        "{% if loop.last and add_generation_prompt %}\n"
-        "{{ '<|assistant|>' }}\n"
-        "{% endif %}\n"
-        "{% endfor %}"
-    )
-
-    bos_token: str = "<|im_start|>"
-    eos_token: str = "<|im_end|>"
-    pad_token: str = "<|im_end|>"
-
-    # set special tokens and them
-    tokenizer.eos_token = eos_token
-    tokenizer.pad_token = pad_token
-    tokenizer.bos_token = bos_token
-    tokenizer.add_special_tokens({"additional_special_tokens": [bos_token, eos_token]})
-    # set chat format for tokenizer
-    tokenizer.chat_template = chatml_template
-
-    model.resize_token_embeddings(len(tokenizer))
-    # Update the model config to use the new eos & bos tokens
-    if getattr(model, "config", None) is not None:
-        model.config.pad_token_id = tokenizer.pad_token_id
-        model.config.bos_token_id = tokenizer.bos_token_id
-        model.config.eos_token_id = tokenizer.eos_token_id
-    # Update the generation config to use the new eos & bos token
-    if getattr(model, "generation_config", None) is not None:
-        model.generation_config.bos_token_id = tokenizer.bos_token_id
-        model.generation_config.eos_token_id = tokenizer.eos_token_id
-        model.generation_config.pad_token_id = tokenizer.pad_token_id
-
+def setup_chat_format(model, tokenizer, config):
+    tokenizer.chat_template = config["chat_template"]
+    tokenizer.add_special_tokens({"additional_special_tokens": config["tokenizer_special_tokens"]})
+    # model.resize_token_embeddings(len(tokenizer))
     return model, tokenizer
 
 
@@ -68,12 +32,13 @@ def tokenize_normal(example, tokenizer):
     return tokenized
 
 
-def tokenizer_ignore_user_messages(example, tokenizer):
+def tokenize_ignore_user_messages(example, tokenizer):
+    # strong assumption on chatml format where the assistant messages are between <|assistant|> and <|im_end|>
     messages = example["messages"]
     text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
     tokenized = tokenizer(text, add_special_tokens=False, truncation=True)
 
-    pattern = re.escape("<|assistant|>\n") + r"(.*?" + re.escape(tokenizer.eos_token) + ")"
+    pattern = re.escape("<|im_start|>assistant\n") + r"(.*?" + re.escape("<|im_end|>") + ")"
     assistent_start_end = [(m.start(1), m.end(1)) for m in re.finditer(pattern, text, re.DOTALL)]
 
     labels = [-100] * len(tokenized["input_ids"])
@@ -99,7 +64,7 @@ def fix_universal_ner(example):
 
 def datasets(config, tokenizer, ignore_user_messages: bool):
 
-    train_tokenizer_fn = tokenizer_ignore_user_messages if ignore_user_messages else tokenize_normal
+    train_tokenizer_fn = tokenize_ignore_user_messages if ignore_user_messages else tokenize_normal
 
     dataset = load_dataset(config["dataset"]["name"])
 
@@ -119,7 +84,7 @@ def datasets(config, tokenizer, ignore_user_messages: bool):
 
     # for the validation I want to track the loss of the assistant messages only!
     val_ds = dataset[config["dataset"]["val_split"]].map(
-        tokenizer_ignore_user_messages,
+        tokenize_ignore_user_messages,
         batched=False,
         num_proc=12,
         remove_columns=[i for i in dataset[config["dataset"]["val_split"]].column_names if i not in columns],
