@@ -19,7 +19,7 @@ from transformers import (
 def setup_chat_format(model, tokenizer, config):
     tokenizer.chat_template = config["chat_template"]
     tokenizer.add_special_tokens({"additional_special_tokens": config["tokenizer_special_tokens"]})
-    # model.resize_token_embeddings(len(tokenizer))
+    model.resize_token_embeddings(len(tokenizer))
     return model, tokenizer
 
 
@@ -146,7 +146,7 @@ def train(config: dict, ignore_user_messages: bool):
     assert tokenizer.chat_template is None, "modify `tokenizer_ignore_user_messages` to handle specific chat template."
 
     model = get_model(config)
-    model, tokenizer = setup_chatml_format(model, tokenizer)
+    model, tokenizer = setup_chat_format(model, tokenizer, config)
 
     train_ds, val_ds = datasets(config, tokenizer, ignore_user_messages)
 
